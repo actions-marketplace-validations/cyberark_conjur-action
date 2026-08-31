@@ -6,6 +6,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.2] - 2026-06-15
+
+### Fixed
+- action.yml uses the correct version
+
+## [2.2.1] - 2026-06-15
+
+### Fixed
+- We now record the server CA into /tmp to avoid permission issues on OpenShift based runners.
+
+## [2.2.0] - 2026-05-19
+
+### Fixed
+- Fixed we now block environment variables with names containing '\n', '<<' or '='.
+- Fixed multiline secret handling - now using GitHub's random-delimiter heredoc form.
+- Fixed masking of multiline secrets.
+- Changed package versions are now pinned.
+
 ## [2.1.1] - 2026-03-23
 
 ### Fixed
@@ -60,8 +78,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial release
 
-[Unreleased]: https://github.com/cyberark/conjur-action/compare/v2.1.1...HEAD
-[2.1.0]: https://github.com/cyberark/conjur-action/compare/v2.1.0...v2.1.1
+[Unreleased]: https://github.com/cyberark/conjur-action/compare/v2.2.1...HEAD
+[2.2.1]: https://github.com/cyberark/conjur-action/compare/v2.2.0...v2.2.1
+[2.2.0]: https://github.com/cyberark/conjur-action/compare/v2.1.1...v2.2.0
+[2.1.1]: https://github.com/cyberark/conjur-action/compare/v2.1.0...v2.1.1
 [2.1.0]: https://github.com/cyberark/conjur-action/compare/v2.0.12...v2.1.0
 [2.0.12]: https://github.com/cyberark/conjur-action/compare/v2.0.11...v2.0.12
 [2.0.11]: https://github.com/cyberark/conjur-action/compare/v2.0.10...v2.0.11

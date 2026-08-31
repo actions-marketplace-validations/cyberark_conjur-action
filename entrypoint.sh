@@ -44,7 +44,8 @@ urlencode() {
 
 create_pem() {
     # Create conjur_account.pem for valid SSL
-    echo "$INPUT_CERTIFICATE" > /conjur-action/conjur_"$INPUT_ACCOUNT".pem
+    mkdir -p /tmp/conjur-action
+    echo "$INPUT_CERTIFICATE" > /tmp/conjur-action/conjur_"$INPUT_ACCOUNT".pem
 }
 
 handle_git_jwt() {
@@ -117,7 +118,7 @@ conjur_authn() {
         
 		if [[ -n "$INPUT_CERTIFICATE" ]]; then
             echo "::debug Authenticating with certificate"
-            token=$(curl --cacert "/conjur-action/conjur_$INPUT_ACCOUNT.pem" --request POST "$REST_API_BASE_URI" --header "Content-Type: application/x-www-form-urlencoded" --header "x-cybr-telemetry: $encoded" --header "Accept-Encoding: base64" --data-urlencode "jwt=$JWT_TOKEN")
+            token=$(curl --cacert "/tmp/conjur-action/conjur_$INPUT_ACCOUNT.pem" --request POST "$REST_API_BASE_URI" --header "Content-Type: application/x-www-form-urlencoded" --header "x-cybr-telemetry: $encoded" --header "Accept-Encoding: base64" --data-urlencode "jwt=$JWT_TOKEN")
 		else
             echo "::debug Authenticating without certificate"
 			token=$(curl --request POST "$REST_API_BASE_URI" --header "Content-Type: application/x-www-form-urlencoded" --header "x-cybr-telemetry: $encoded" --header "Accept-Encoding: base64" --data-urlencode "jwt=$JWT_TOKEN")
@@ -132,7 +133,7 @@ conjur_authn() {
 		if [[ -n "$INPUT_CERTIFICATE" ]]; then
 			# Authenticate and receive session token from Conjur - encode Base64
 			echo "::debug Authenticating with certificate"
-            token=$(curl --cacert "/conjur-action/conjur_$INPUT_ACCOUNT.pem" --data "$INPUT_API_KEY" "$INPUT_URL/authn/$INPUT_ACCOUNT/$hostId/authenticate" --header "Content-Type: application/x-www-form-urlencoded"  --header "x-cybr-telemetry: $encoded" --header "Accept-Encoding: base64")
+            token=$(curl --cacert "/tmp/conjur-action/conjur_$INPUT_ACCOUNT.pem" --data "$INPUT_API_KEY" "$INPUT_URL/authn/$INPUT_ACCOUNT/$hostId/authenticate" --header "Content-Type: application/x-www-form-urlencoded"  --header "x-cybr-telemetry: $encoded" --header "Accept-Encoding: base64")
 		else
 			# Authenticate and receive session token from Conjur - encode Base64
             echo "::debug Authenticating without certificate"
@@ -147,46 +148,62 @@ array_secrets() {
 }
 
 set_secrets() {
-  if [[ ${SECRETS[@]} ]]; then
-    telemetry_header
-    for secret in "${SECRETS[@]}"; do
-        local IFS='|'
-        read -ra METADATA <<< "$secret" # [0]=db/sqlusername [1]=sql_username
+    if [[ ${SECRETS[@]} ]]; then
+        telemetry_header
+        for secret in "${SECRETS[@]}"; do
+            local IFS='|'
+            read -ra METADATA <<< "$secret" # [0]=db/sqlusername [1]=sql_username
 
-        if [[ "${#METADATA[@]}" == 2 ]]; then
-            secretId=$(urlencode "${METADATA[0]}")
-            envVar=${METADATA[1]^^}
-        else
-            secretId=${METADATA[0]}
-            local IFS='/'
-            read -ra SPLITSECRET <<< "$secretId" # [0]=db [1]=sql_password
-            arrLength=${#SPLITSECRET[@]} # Get array length
-            lastIndex=$((arrLength-1)) # Subtract one for last index
-            envVar=${SPLITSECRET[$lastIndex]^^}
-            secretId=$(urlencode "${METADATA[0]}")
-        fi
+            if [[ "${#METADATA[@]}" == 2 ]]; then
+                secretId=$(urlencode "${METADATA[0]}")
+                envVar=${METADATA[1]^^}
+            else
+                secretId=${METADATA[0]}
+                local IFS='/'
+                read -ra SPLITSECRET <<< "$secretId" # [0]=db [1]=sql_password
+                arrLength=${#SPLITSECRET[@]} # Get array length
+                lastIndex=$((arrLength-1)) # Subtract one for last index
+                envVar=${SPLITSECRET[$lastIndex]^^}
+                secretId=$(urlencode "${METADATA[0]}")
+            fi
 
-        if [[ -n "$INPUT_CERTIFICATE" ]]; then
-            echo "::debug Retrieving secret with certificate"
-            secretVal=$(curl --cacert "/conjur-action/conjur_$INPUT_ACCOUNT.pem" -H "Authorization: Token token=\"$token\"" --header "x-cybr-telemetry: $encoded" "$INPUT_URL/secrets/$INPUT_ACCOUNT/variable/$secretId")
-        else
-            echo "::debug Retrieving secret without certificate"
-            secretVal=$(curl -H "Authorization: Token token=\"$token\"" --header "x-cybr-telemetry: $encoded" "$INPUT_URL/secrets/$INPUT_ACCOUNT/variable/$secretId")
-        fi
+            if [[ -n "$INPUT_CERTIFICATE" ]]; then
+                echo "::debug Retrieving secret with certificate"
+                secretVal=$(curl --cacert "/tmp/conjur-action/conjur_$INPUT_ACCOUNT.pem" -H "Authorization: Token token=\"$token\"" --header "x-cybr-telemetry: $encoded" "$INPUT_URL/secrets/$INPUT_ACCOUNT/variable/$secretId")
+            else
+                echo "::debug Retrieving secret without certificate"
+                secretVal=$(curl -H "Authorization: Token token=\"$token\"" --header "x-cybr-telemetry: $encoded" "$INPUT_URL/secrets/$INPUT_ACCOUNT/variable/$secretId")
+            fi
 
-        if [[ "${secretVal}" == "Malformed authorization token" ]]; then
-            echo "::error::Malformed authorization token. Please check your Conjur account, username, and API key. If using authn-jwt, check your Host ID annotations are correct."
-            exit 1
-	elif [[ "${secretVal}" == *"is empty or not found"* ]]; then
-	    echo "::error::${secretVal}"
-	    exit 1
-        fi
-        echo ::add-mask::"${secretVal}" # Masks the value in all logs & output
-        echo "${envVar}=${secretVal}" >> "${GITHUB_ENV}" # Set environment variable
-    done
-  else
-   echo "::error::No secret found for retrieval from Conjur Vault"
-  fi
+            if [[ "${secretVal}" == "Malformed authorization token" ]]; then
+                echo "::error::Malformed authorization token. Please check your Conjur account, username, and API key. If using authn-jwt, check your Host ID annotations are correct."
+                exit 1
+            elif [[ "${secretVal}" == *"is empty or not found"* ]]; then
+                echo "::error::${secretVal}"
+                exit 1
+            fi
+            if [[ "${envVar}" =~ $'\n' || "${envVar}" == *"<<"* || "${envVar}" == *"="* || -z "${envVar}" ]]; then                                                                                    
+                echo "::error::Invalid environment variable name '${envVar}'; refusing to write."                                                                             
+                exit 1                                                                                                                                                        
+            fi
+            local _delim="EOF_$RANDOM$RANDOM$RANDOM"
+            if [[ "${secretVal}" == *"${_delim}"* ]]; then
+                echo "::error::Secret value contains env delimiter; refusing to write."
+                exit 1
+            fi
+            
+            while IFS= read -r _maskLine; do
+                [[ -n "${_maskLine}" ]] && echo "::add-mask::${_maskLine}"
+            done <<< "${secretVal}"     
+            {
+                echo "${envVar}<<${_delim}"
+                echo "${secretVal}"
+                echo "${_delim}"
+            } >> "${GITHUB_ENV}"
+        done
+    else
+        echo "::error::No secret found for retrieval from Conjur Vault"
+    fi
 }
 
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
