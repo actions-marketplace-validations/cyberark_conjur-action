@@ -3,7 +3,29 @@
 
 script_dir=$(dirname "$(realpath "$0")")
 
+# Secure temp directory — created on first use, cleaned on EXIT.
+CONJUR_TMP_DIR=""
+
+_conjur_init_tmp() {
+    if [[ -z "$CONJUR_TMP_DIR" ]]; then
+        CONJUR_TMP_DIR=$(mktemp -d)
+        trap "rm -rf -- '$CONJUR_TMP_DIR'" EXIT
+    fi
+}
+
+validate_url() {
+    if [[ "$INPUT_URL" == http://* ]]; then
+        if [[ "${INPUT_ALLOW_INSECURE_CONNECTIONS,,}" == "true" ]]; then
+            echo "::warning::Connecting to Conjur over HTTP is insecure and not recommended for production use."
+        else
+            echo "::error::HTTP connections are not allowed. Use an HTTPS URL or set allow_insecure_connections: 'true' to override."
+            exit 1
+        fi
+    fi
+}
+
 main() {
+    validate_url
     create_pem
     if [[ -z "$INPUT_AUTHN_TOKEN_FILE" ]]; then
         conjur_authn
@@ -43,9 +65,60 @@ urlencode() {
 }
 
 create_pem() {
-    # Create conjur_account.pem for valid SSL
-    mkdir -p /tmp/conjur-action
-    echo "$INPUT_CERTIFICATE" > /tmp/conjur-action/conjur_"$INPUT_ACCOUNT".pem
+    # Write the CA cert under a private, process-owned temp dir (mktemp -d creates 0700)
+    _conjur_init_tmp
+    local old_umask
+    old_umask=$(umask)
+    umask 077
+    echo "$INPUT_CERTIFICATE" > "$CONJUR_TMP_DIR/conjur_${INPUT_ACCOUNT}.pem"
+    umask "$old_umask"
+}
+
+create_client_cert_files() {
+    _conjur_init_tmp
+    local old_umask
+    old_umask=$(umask)
+    umask 077
+    printf '%s' "$INPUT_CLIENT_CERT" > "$CONJUR_TMP_DIR/client.crt"
+    printf '%s' "$INPUT_CLIENT_KEY" > "$CONJUR_TMP_DIR/client.key"
+    umask "$old_umask"
+}
+
+conjur_curl() {
+    local cert_args=()
+    if [[ -n "$INPUT_CERTIFICATE" ]]; then
+        cert_args=(--cacert "$CONJUR_TMP_DIR/conjur_$INPUT_ACCOUNT.pem")
+    fi
+
+    # Enforce HTTPS unless the caller has explicitly opted into HTTP via
+    # allow_insecure_connections and the URL is actually http://.
+    local tls_args=()
+    if [[ "${INPUT_URL,,}" != http://* || "${INPUT_ALLOW_INSECURE_CONNECTIONS,,}" != "true" ]]; then
+        tls_args=(--proto '=https' --proto-redir '=https' --ssl-reqd)
+    fi
+
+    local response rc
+    response=$(curl -sS --show-error --write-out $'\n%{http_code}' "${cert_args[@]}" "${tls_args[@]}" "$@")
+    rc=$?
+
+    if (( rc != 0 )); then
+        http_status=""
+        http_body="$response"
+        return $rc
+    fi
+
+    http_status=${response##*$'\n'}
+    http_body=${response%$'\n'*}
+    return 0
+}
+
+debug_cert_mode() {
+    local context=$1
+    if [[ -n "$INPUT_CERTIFICATE" ]]; then
+        echo "::debug ${context} with certificate"
+    else
+        echo "::debug ${context} without certificate"
+    fi
 }
 
 handle_git_jwt() {
@@ -105,7 +178,8 @@ conjur_authn() {
             token_url="${token_url}&audience=$(urlencode "${INPUT_AUDIENCE}")"
         fi
         
-        JWT_TOKEN=$(curl -s -H "Authorization:bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$token_url" | jq -r .value)
+        JWT_TOKEN=$(printf 'header = "Authorization: bearer %s"\n' "$ACTIONS_ID_TOKEN_REQUEST_TOKEN" | \
+            curl -s --config - "$token_url" | jq -r .value)
         handle_git_jwt "$JWT_TOKEN"
 
         REST_API_BASE_URI="${INPUT_URL}/authn-jwt/${INPUT_AUTHN_ID}/${INPUT_ACCOUNT}/authenticate"
@@ -116,29 +190,85 @@ conjur_authn() {
             REST_API_BASE_URI="${INPUT_URL}/authn-jwt/${INPUT_AUTHN_ID}/${INPUT_ACCOUNT}/${hostId}/authenticate"
         fi
         
-		if [[ -n "$INPUT_CERTIFICATE" ]]; then
-            echo "::debug Authenticating with certificate"
-            token=$(curl --cacert "/tmp/conjur-action/conjur_$INPUT_ACCOUNT.pem" --request POST "$REST_API_BASE_URI" --header "Content-Type: application/x-www-form-urlencoded" --header "x-cybr-telemetry: $encoded" --header "Accept-Encoding: base64" --data-urlencode "jwt=$JWT_TOKEN")
-		else
-            echo "::debug Authenticating without certificate"
-			token=$(curl --request POST "$REST_API_BASE_URI" --header "Content-Type: application/x-www-form-urlencoded" --header "x-cybr-telemetry: $encoded" --header "Accept-Encoding: base64" --data-urlencode "jwt=$JWT_TOKEN")
-		fi
+        debug_cert_mode "Authenticating"
+        local _jwt_body
+        _jwt_body="jwt=$(urlencode "$JWT_TOKEN")"
+        conjur_curl --request POST "$REST_API_BASE_URI" \
+                --header "Content-Type: application/x-www-form-urlencoded" \
+                --header "x-cybr-telemetry: $encoded" \
+                --header "Accept-Encoding: base64" \
+                --data-binary @- < <(printf '%s' "$_jwt_body") || {
+            local rc=$?
+            echo "::error::Conjur authentication request failed (curl exit $rc)"
+            exit 1
+        }
+        if [[ "$http_status" != "200" ]]; then
+            echo "::error::Conjur authentication failed (HTTP $http_status): $http_body"
+            exit 1
+        fi
+        token="${http_body//$'\n'/}"
+    elif [[ -n "$INPUT_AUTHN_CERT_ID" ]]; then
+        echo "::debug Authenticate via Authn-Cert"
 
+        if [[ -z "$INPUT_CLIENT_CERT" ]]; then
+            echo "::error::client_cert is required for certificate authentication"
+            exit 1
+        fi
+        if [[ -z "$INPUT_CLIENT_KEY" ]]; then
+            echo "::error::client_key is required for certificate authentication"
+            exit 1
+        fi
+
+        create_client_cert_files
+
+        # host_id is required for request host-mode (default), but optional for
+        # SPIFFE host-mode (self-hosted) where the workload is derived from the
+        # certificate's SPIFFE ID — same optional pattern as authn-jwt.
+        local REST_API_BASE_URI="${INPUT_URL}/authn-cert/${INPUT_AUTHN_CERT_ID}/${INPUT_ACCOUNT}/authenticate"
+        if [[ -n "$INPUT_HOST_ID" ]]; then
+            echo "::debug Authenticate using Host ID"
+            local workloadId
+            workloadId=$(urlencode "$INPUT_HOST_ID")
+            REST_API_BASE_URI="${INPUT_URL}/authn-cert/${INPUT_AUTHN_CERT_ID}/${INPUT_ACCOUNT}/${workloadId}/authenticate"
+        fi
+
+        debug_cert_mode "Authenticating"
+        conjur_curl --request POST "$REST_API_BASE_URI" \
+                --cert "$CONJUR_TMP_DIR/client.crt" \
+                --key "$CONJUR_TMP_DIR/client.key" \
+                --header "Accept-Encoding: base64" \
+                --header "x-cybr-telemetry: $encoded" || {
+            local rc=$?
+            echo "::error::Conjur authentication request failed (curl exit $rc)"
+            exit 1
+        }
+        if [[ "$http_status" != "200" ]]; then
+            echo "::error::Conjur authentication failed (HTTP $http_status): $http_body"
+            exit 1
+        fi
+        token="${http_body//$'\n'/}"
 	else
-		echo "::debug Authenticate using Host ID & API Key"
+        echo "::debug Authenticate using Host ID & API Key"
 
         # URL-encode Host ID for future use
         hostId=$(urlencode "$INPUT_HOST_ID")
 
-		if [[ -n "$INPUT_CERTIFICATE" ]]; then
-			# Authenticate and receive session token from Conjur - encode Base64
-			echo "::debug Authenticating with certificate"
-            token=$(curl --cacert "/tmp/conjur-action/conjur_$INPUT_ACCOUNT.pem" --data "$INPUT_API_KEY" "$INPUT_URL/authn/$INPUT_ACCOUNT/$hostId/authenticate" --header "Content-Type: application/x-www-form-urlencoded"  --header "x-cybr-telemetry: $encoded" --header "Accept-Encoding: base64")
-		else
-			# Authenticate and receive session token from Conjur - encode Base64
-            echo "::debug Authenticating without certificate"
-			token=$(curl --request POST --data "$INPUT_API_KEY" "$INPUT_URL/authn/$INPUT_ACCOUNT/$hostId/authenticate" --header "Content-Type: application/x-www-form-urlencoded" --header "x-cybr-telemetry: $encoded" --header "Accept-Encoding: base64")
-		fi
+        debug_cert_mode "Authenticating"
+        conjur_curl --request POST \
+                "$INPUT_URL/authn/$INPUT_ACCOUNT/$hostId/authenticate" \
+                --header "Content-Type: application/x-www-form-urlencoded" \
+                --header "x-cybr-telemetry: $encoded" \
+                --header "Accept-Encoding: base64" \
+                --data-binary @- < <(printf '%s' "$INPUT_API_KEY") || {
+            local rc=$?
+            echo "::error::Conjur authentication request failed (curl exit $rc)"
+            exit 1
+        }
+        if [[ "$http_status" != "200" ]]; then
+            echo "::error::Conjur authentication failed (HTTP $http_status): $http_body"
+            exit 1
+        fi
+        token="${http_body//$'\n'/}"
     fi
 }
 
@@ -167,12 +297,22 @@ set_secrets() {
                 secretId=$(urlencode "${METADATA[0]}")
             fi
 
-            if [[ -n "$INPUT_CERTIFICATE" ]]; then
-                echo "::debug Retrieving secret with certificate"
-                secretVal=$(curl --cacert "/tmp/conjur-action/conjur_$INPUT_ACCOUNT.pem" -H "Authorization: Token token=\"$token\"" --header "x-cybr-telemetry: $encoded" "$INPUT_URL/secrets/$INPUT_ACCOUNT/variable/$secretId")
-            else
-                echo "::debug Retrieving secret without certificate"
-                secretVal=$(curl -H "Authorization: Token token=\"$token\"" --header "x-cybr-telemetry: $encoded" "$INPUT_URL/secrets/$INPUT_ACCOUNT/variable/$secretId")
+            debug_cert_mode "Retrieving secret"
+            local _auth_hdr="${CONJUR_TMP_DIR}/.auth_header"
+            printf 'Authorization: Token token="%s"' "$token" > "$_auth_hdr"
+            conjur_curl --header "@${_auth_hdr}" \
+                    --header "x-cybr-telemetry: $encoded" \
+                    "$INPUT_URL/secrets/$INPUT_ACCOUNT/variable/$secretId" || {
+                local rc=$?
+                rm -f "$_auth_hdr"
+                echo "::error::Secret retrieval request failed (curl exit $rc)"
+                exit 1
+            }
+            rm -f "$_auth_hdr"
+            secretVal=$http_body
+            if [[ "$http_status" != "200" ]]; then
+                echo "::error::Failed to retrieve secret '$secretId' (HTTP $http_status)."
+                exit 1
             fi
 
             if [[ "${secretVal}" == "Malformed authorization token" ]]; then
@@ -194,7 +334,7 @@ set_secrets() {
             
             while IFS= read -r _maskLine; do
                 [[ -n "${_maskLine}" ]] && echo "::add-mask::${_maskLine}"
-            done <<< "${secretVal}"     
+            done <<< "${secretVal}"
             {
                 echo "${envVar}<<${_delim}"
                 echo "${secretVal}"

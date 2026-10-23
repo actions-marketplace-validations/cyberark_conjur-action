@@ -109,7 +109,7 @@ function deploy_conjur_enterprise {
     # Authenticate the CLI container
     docker exec "$(cli_cid)" /bin/sh -c "
       if [ ! -e /root/conjur-demo.pem ]; then
-        echo y | conjur init -u ${CONJUR_APPLIANCE_URL} -a ${CONJUR_ACCOUNT} --force --self-signed
+        echo y | conjur init self-hosted -u ${CONJUR_APPLIANCE_URL} -a ${CONJUR_ACCOUNT} --force --self-signed
       fi
       conjur login -i admin -p MySecretP@ss1
     "
@@ -140,6 +140,26 @@ function deploy_conjur_cloud() {
   set_conjur_cloud_variable "data/github-app/Dev-Team-credential2" "test_dev_2\nNEXT_VALUE=nextvalue"
 }
 
+function verify_http_url_validation_bypassed() {
+  local log_file="$1"
+
+  # act's log interleaves all jobs, so scope the search to the
+  # http-url-allowed-with-warning job's section specifically. It's the last
+  # job in main.yml, so once its marker is seen, read to EOF.
+  local job_log
+  job_log=$(awk '/\[conjur-action Test\/http-url-allowed-with-warning\]/{p=1} p' "$log_file")
+
+  if echo "$job_log" | grep -q "HTTP connections are not allowed"; then
+    echo "FAIL: URL validation blocked the HTTP connection despite allow_insecure_connections: 'true'"
+    exit 1
+  fi
+  if ! echo "$job_log" | grep -q "Connecting to Conjur over HTTP is insecure"; then
+    echo "FAIL: expected URL validation warning for bypassed HTTP connection, but it was not found in the act log"
+    exit 1
+  fi
+  echo "PASS: URL validation correctly bypassed HTTP with allow_insecure_connections set"
+}
+
 function load_container_image_into_act() {
   local compose_file="$1"
   local compose_args=()
@@ -154,8 +174,123 @@ function load_container_image_into_act() {
   if [ -n "$CONTAINER_IMAGE_TAR" ]; then
     docker cp "$CONTAINER_IMAGE_TAR" act_container:/tmp/
     # docker compose "${compose_args[@]}" exec -T act bash -c "docker load -i /tmp/$(basename "$CONTAINER_IMAGE_TAR")"
-    docker compose "${compose_args[@]}" exec -T act bash -c "docker tag \$(docker load -i /tmp/$(basename "$CONTAINER_IMAGE_TAR") | grep -o 'Loaded image: .*' | cut -d' ' -f3) cyberark/conjur-action:2.2.2"
+    docker compose "${compose_args[@]}" exec -T act bash -c "docker tag \$(docker load -i /tmp/$(basename "$CONTAINER_IMAGE_TAR") | grep -o 'Loaded image: .*' | cut -d' ' -f3) cyberark/conjur-action:3.0.1"
   fi
+}
+
+function setup_edge_authn_cert() {
+  local svc_id="github-cert"
+  local host_id="github-cert-runner"
+  local cloud_url="${INFRAPOOL_CONJUR_APPLIANCE_URL}/api"
+  local cert_dir
+  cert_dir="$(bin_dir)/tmp/authn_cert"
+  mkdir -p "$cert_dir"
+
+  echo "---- generating authn-cert client certificates ----"
+  openssl req -x509 -newkey rsa:4096 -sha256 -days 1 -nodes \
+    -keyout "$cert_dir/ca.key" -out "$cert_dir/ca.crt" \
+    -subj "/CN=github-action-cert-ca" 2>/dev/null
+
+  openssl req -newkey rsa:2048 -nodes \
+    -keyout "$cert_dir/client.key" -out "$cert_dir/client.csr" \
+    -subj "/CN=${host_id}" 2>/dev/null
+
+  openssl x509 -req -days 1 -sha256 \
+    -in "$cert_dir/client.csr" \
+    -CA "$cert_dir/ca.crt" -CAkey "$cert_dir/ca.key" -CAcreateserial \
+    -out "$cert_dir/client.crt" 2>/dev/null
+
+  echo "---- loading authn-cert/${svc_id} authenticator policy ----"
+  curl -s -o /dev/null -w "authn-cert policy: HTTP %{http_code}\n" \
+    -H "Authorization: Token token=\"$INFRAPOOL_CONJUR_AUTHN_TOKEN\"" \
+    -X POST \
+    -d "
+- !policy
+  id: ${svc_id}
+  body:
+    - !webservice
+    - !variable ca-cert
+    - !group apps
+    - !permit
+      role: !group apps
+      privilege: [read, authenticate]
+      resource: !webservice
+" \
+    "${cloud_url}/policies/conjur/policy/conjur%2Fauthn-cert"
+
+  echo "---- loading github-cert-apps workload policy ----"
+  curl -s -o /dev/null -w "workload policy: HTTP %{http_code}\n" \
+    -H "Authorization: Token token=\"$INFRAPOOL_CONJUR_AUTHN_TOKEN\"" \
+    -X POST \
+    -d "
+- !policy
+  id: github-cert-apps
+  body:
+    - !group
+
+    - !host
+      id: ${host_id}
+      annotations:
+        authn-cert/${svc_id}/cn: ${host_id}
+
+    - !variable authn-cert-credential
+
+    - !grant
+      role: !group
+      member: !host ${host_id}
+
+    - !permit
+      role: !group
+      privilege: [read, execute]
+      resource: !variable authn-cert-credential
+" \
+    "${cloud_url}/policies/conjur/policy/data"
+
+  echo "---- granting workload group access to authenticator ----"
+  curl -s -o /dev/null -w "grant policy: HTTP %{http_code}\n" \
+    -H "Authorization: Token token=\"$INFRAPOOL_CONJUR_AUTHN_TOKEN\"" \
+    -X POST \
+    -d "
+- !grant
+  role: !group apps
+  member: !group /data/github-cert-apps
+" \
+    "${cloud_url}/policies/conjur/policy/conjur%2Fauthn-cert%2F${svc_id}"
+
+  echo "---- setting CA cert variable ----"
+  local encoded_ca_path
+  encoded_ca_path=$(url_encode "conjur/authn-cert/${svc_id}/ca-cert")
+  curl -s -o /dev/null -w "ca-cert variable: HTTP %{http_code}\n" \
+    -H "Authorization: Token token=\"$INFRAPOOL_CONJUR_AUTHN_TOKEN\"" \
+    -X POST --data-urlencode "@${cert_dir}/ca.crt" \
+    "${cloud_url}/secrets/conjur/variable/${encoded_ca_path}"
+
+  echo "---- setting authn-cert test secret ----"
+  local encoded_secret_path
+  encoded_secret_path=$(url_encode "data/github-cert-apps/authn-cert-credential")
+  curl -s -o /dev/null -w "test secret: HTTP %{http_code}\n" \
+    -H "Authorization: Token token=\"$INFRAPOOL_CONJUR_AUTHN_TOKEN\"" \
+    -X POST --data-urlencode "test_cert_auth_value" \
+    "${cloud_url}/secrets/conjur/variable/${encoded_secret_path}"
+
+  echo "---- enabling authn-cert/${svc_id} ----"
+  curl -s -o /dev/null -w "enable authenticator: HTTP %{http_code}\n" \
+    -H "Authorization: Token token=\"$INFRAPOOL_CONJUR_AUTHN_TOKEN\"" \
+    -X PATCH -H "Content-Type: application/x-www-form-urlencoded" \
+    --data "enabled=true" \
+    "${cloud_url}/authn-cert/${svc_id}/conjur"
+
+  echo "---- waiting for Edge to sync authn-cert/${svc_id} ----"
+  sleep 70
+
+  export AUTHN_CERT_ID="${svc_id}"
+  export AUTHN_CERT_HOST_ID="host/data/github-cert-apps/${host_id}"
+  export CLIENT_CERT
+  CLIENT_CERT="$(cat "$cert_dir/client.crt")"
+  export CLIENT_KEY
+  CLIENT_KEY="$(cat "$cert_dir/client.key")"
+  export CONJUR_AUTHN_CERT_SECRET="data/github-cert-apps/authn-cert-credential"
+  export AUTHN_CERT_SECRET_VALUE="test_cert_auth_value"
 }
 
 function main() {
@@ -209,6 +344,8 @@ function main() {
     export CONJUR_SSL_CERTIFICATE=$(cat $(bin_dir)/conjur.pem)
     # Adding edge to the docker network
     docker network inspect $DOCKER_NETWORK --format '{{json .Containers}}' | grep -q 'edge-test' || docker network connect $DOCKER_NETWORK edge-test
+    # Set up authn-cert authenticator, workload and certificates for E2E tests
+    setup_edge_authn_cert
     #Enable the debugging
     set -x
   else
@@ -226,8 +363,10 @@ function main() {
   fi
 
   mkdir -p "$(git rev-parse --show-toplevel)/.github/workflows"
+  conjur_http_url="${CONJUR_APPLIANCE_URL/https:\/\//http://}"
   cat <<EOF > $(git rev-parse --show-toplevel)/.github/workflows/.secrets
 URL="$CONJUR_APPLIANCE_URL"
+CONJUR_HTTP_URL="$conjur_http_url"
 ACCOUNT="$CONJUR_ACCOUNT"
 HOST_ID="$CONJUR_AUTHN_LOGIN"
 API_KEY="$ADMIN_API_KEY"
@@ -236,6 +375,12 @@ SECRET="$CONJUR_SECRET"
 MULTILINE_SECRET="$CONJUR_MULTILINE_SECRET"
 SECRET_VALUE="test_dev_1"
 CERTIFICATE="$CONJUR_SSL_CERTIFICATE"
+AUTHN_CERT_ID="$AUTHN_CERT_ID"
+AUTHN_CERT_HOST_ID="$AUTHN_CERT_HOST_ID"
+CLIENT_CERT="$CLIENT_CERT"
+CLIENT_KEY="$CLIENT_KEY"
+AUTHN_CERT_SECRET="$CONJUR_AUTHN_CERT_SECRET"
+AUTHN_CERT_SECRET_VALUE="$AUTHN_CERT_SECRET_VALUE"
 EOF
   if [[ "$ENTERPRISE" == "true" ]]; then
     docker compose -f docker-compose.enterpise.yml up -d --build act
@@ -247,7 +392,9 @@ EOF
     load_container_image_into_act "docker-compose.yml"
     docker compose exec -T act bash -c "cp /conjur-action-git/bin/main.yml /conjur-action-git/.github/workflows"
     echo "---- running github action locally ----"
-    docker compose exec -T act bash -c "act --network $DOCKER_NETWORK -P node:16-buster-slim  --pull=false --secret-file=./.github/workflows/.secrets push"
+    docker compose exec -T act bash -c "act --network $DOCKER_NETWORK -P node:16-buster-slim  --pull=false --secret-file=./.github/workflows/.secrets push" \
+      | tee "$(bin_dir)/tmp/act_run.log"
+    verify_http_url_validation_bypassed "$(bin_dir)/tmp/act_run.log"
   fi
 }
 
